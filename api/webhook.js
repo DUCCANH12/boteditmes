@@ -1,20 +1,15 @@
 // api/webhook.js — Telegram Code Detector Bot
-// Deploy on Vercel · Set env var: TELEGRAM_BOT_TOKEN
-
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// ─── Marker để nhận biết bài đã được bot chỉnh sửa (tránh vòng lặp) ──────────
-const CODES_MARKER = '👆 Nhấn vào mã để sao chép';
+const EDIT_MARKER = '\u200b'; // Zero-width space — dấu hiệu bài đã được bot sửa
 
-// ─── Danh sách ID được phép (chủ bot + các kênh) ─────────────────────────────
 const ALLOWED_IDS = new Set([
-  1400175163,       // Chủ bot
-  -1001578007378,   // Kênh 1
-  -1002109878033,   // Kênh 2
+  1400175163,
+  -1001578007378,
+  -1002109878033,
 ]);
 
-// ─── Danh sách từ bị loại trừ ────────────────────────────────────────────────
 const EXCLUDED_WORDS = new Set([
   'SHOPEE', 'LAZADA', 'TIKI', 'SENDO', 'GRAB', 'GOJEK', 'GOVIET',
   'MOMO', 'ZALOPAY', 'VNPAY', 'VNPT', 'VIETTEL', 'MOBIFONE',
@@ -32,7 +27,6 @@ const EXCLUDED_WORDS = new Set([
   'LIST', 'BACK',
 ]);
 
-// ─── Phát hiện URL ────────────────────────────────────────────────────────────
 function isUrl(token) {
   if (/^https?:\/\//i.test(token)) return true;
   if (/^www\./i.test(token)) return true;
@@ -41,45 +35,37 @@ function isUrl(token) {
   return false;
 }
 
-// ─── Kiểm tra quyền truy cập ─────────────────────────────────────────────────
-function isAllowed(chatId) {
-  return ALLOWED_IDS.has(chatId);
+function isCode(word) {
+  const cleaned = word.replace(/^[^A-Z0-9a-z]+|[^A-Z0-9a-z]+$/gi, '');
+  if (!cleaned) return false;
+  if (/[./\\]/.test(cleaned)) return false;
+  if (!/[A-Z]{2}/.test(cleaned)) return false;
+  if (!/^[A-Z0-9]+$/.test(cleaned)) return false;
+  if (cleaned.length < 3 || cleaned.length > 20) return false;
+  if (EXCLUDED_WORDS.has(cleaned)) return false;
+  if (/^\d+$/.test(cleaned)) return false;
+  return true;
 }
 
-// ─── Trích xuất mã từ văn bản ─────────────────────────────────────────────────
-function extractCodes(text) {
-  if (!text) return [];
+// ─── Thay thế mã inline, giữ nguyên phần còn lại ────────────────────────────
+function inlineWrapCodes(text) {
+  // Tách theo khoảng trắng nhưng giữ lại delimiter để ghép lại đúng
+  return text.replace(/(\S+)/g, (token) => {
+    if (isUrl(token)) return token;
 
-  const found = new Set();
-  const tokens = text.split(/\s+/);
+    // Tách phần prefix/suffix không phải chữ số
+    const match = token.match(/^([^A-Za-z0-9]*)([A-Za-z0-9][^\s]*)([^A-Za-z0-9]*)$/);
+    if (!match) return token;
 
-  for (let token of tokens) {
-    if (isUrl(token)) continue;
+    const [, prefix, core, suffix] = match;
 
-    const cleaned = token.replace(/^[^A-Z0-9a-z]+|[^A-Z0-9a-z]+$/gi, '');
-    if (!cleaned) continue;
-    if (/[./\\]/.test(cleaned)) continue;
-    if (!/[A-Z]{2}/.test(cleaned)) continue;
-    if (!/^[A-Z0-9]+$/.test(cleaned)) continue;
-    if (cleaned.length < 3 || cleaned.length > 20) continue;
-    if (EXCLUDED_WORDS.has(cleaned)) continue;
-    if (/^\d+$/.test(cleaned)) continue;
-
-    found.add(cleaned);
-  }
-
-  return [...found];
+    if (isCode(core)) {
+      return `${prefix}<code>${core}</code>${suffix}`;
+    }
+    return token;
+  });
 }
 
-// ─── Escape HTML để không bị lỗi parse_mode ──────────────────────────────────
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-// ─── Chỉnh sửa tin nhắn gốc ──────────────────────────────────────────────────
 async function editMessage(chatId, messageId, newText) {
   const res = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
@@ -95,59 +81,45 @@ async function editMessage(chatId, messageId, newText) {
   return res.json();
 }
 
-// ─── Xử lý tin nhắn ──────────────────────────────────────────────────────────
 async function processMessage(message) {
   if (!message) return;
-
-  // Chỉ xử lý chat trong danh sách cho phép
-  if (!isAllowed(message.chat.id)) return;
+  if (!ALLOWED_IDS.has(message.chat.id)) return;
 
   const text = message.text || message.caption || '';
   if (!text) return;
 
-  // Nếu bài đã có marker → bot đã sửa rồi, bỏ qua (tránh vòng lặp vô tận)
-  if (text.includes(CODES_MARKER)) return;
+  // Nếu đã có EDIT_MARKER → bài đã sửa rồi, bỏ qua
+  if (text.includes(EDIT_MARKER)) return;
 
-  const codes = extractCodes(text);
-  if (codes.length === 0) return;
+  const wrapped = inlineWrapCodes(text);
 
-  const codeList = codes.map(c => `<code>${c}</code>`).join('\n');
+  // Không có gì thay đổi → không cần edit
+  if (wrapped === text) return;
 
-  // Ghép nội dung gốc (escape HTML) + phần mã phía dưới
-  const newText =
-    escapeHtml(text) +
-    '\n\n━━━━━━━━━━━━━━\n' +
-    `🏷️ <b>${codes.length > 1 ? 'Các mã' : 'Mã'} phát hiện:</b>\n\n` +
-    codeList + '\n\n' +
-    `<i>${CODES_MARKER}</i>`;
+  // Thêm EDIT_MARKER vô hình vào cuối để đánh dấu
+  const final = wrapped + EDIT_MARKER;
 
-  // Telegram giới hạn 4096 ký tự / tin nhắn
-  if (newText.length > 4096) {
-    console.warn('Message too long to edit:', newText.length);
+  if (final.length > 4096) {
+    console.warn('Too long:', final.length);
     return;
   }
 
-  await editMessage(message.chat.id, message.message_id, newText);
+  await editMessage(message.chat.id, message.message_id, final);
 }
 
-// ─── Vercel Serverless Handler ────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
   if (req.method === 'GET') {
     return res.status(200).json({ ok: true, status: 'Bot is running 🤖' });
   }
-
   if (req.method !== 'POST') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
   }
 
   try {
     const update = req.body;
-
-    // Chỉ xử lý tin nhắn MỚI — không xử lý edited để tránh vòng lặp
     const message = update.message || update.channel_post;
-    if (message) {
-      await processMessage(message);
-    }
+    if (message) await processMessage(message);
+    // Không xử lý edited_message để tránh vòng lặp
   } catch (err) {
     console.error('Bot error:', err);
   }
