@@ -4,6 +4,9 @@
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
+// ─── Marker để nhận biết bài đã được bot chỉnh sửa (tránh vòng lặp) ──────────
+const CODES_MARKER = '👆 Nhấn vào mã để sao chép';
+
 // ─── Danh sách ID được phép (chủ bot + các kênh) ─────────────────────────────
 const ALLOWED_IDS = new Set([
   1400175163,       // Chủ bot
@@ -11,7 +14,7 @@ const ALLOWED_IDS = new Set([
   -1002109878033,   // Kênh 2
 ]);
 
-// ─── Danh sách từ bị loại trừ (viết HOA) ─────────────────────────────────────
+// ─── Danh sách từ bị loại trừ ────────────────────────────────────────────────
 const EXCLUDED_WORDS = new Set([
   'SHOPEE', 'LAZADA', 'TIKI', 'SENDO', 'GRAB', 'GOJEK', 'GOVIET',
   'MOMO', 'ZALOPAY', 'VNPAY', 'VNPT', 'VIETTEL', 'MOBIFONE',
@@ -21,11 +24,12 @@ const EXCLUDED_WORDS = new Set([
   'SIM', 'TOP', 'UY', 'TÍN', 'GIÁ', 'TỐT', 'MÃ', 'CODE',
   'GOM', 'ORDER', 'NOTE', 'LIVE', 'POST', 'LINK', 'PAGE',
   'GROUP', 'ADMIN', 'MOD', 'JOIN', 'CHAT', 'NEWS', 'OPEN',
-  'FORM', 'USER', 'PASS', 'BUY', 'PAY', 'SHIP', 'FAST',
+  'FORM', 'USER', 'PASS', 'BUY', 'PAY', 'FAST',
   'MAX', 'MIN', 'GET', 'SET', 'ADD', 'YES', 'NO',
-  'HOT', 'NOW', 'OFF', 'TAG', 'VND', 'USD', 'EUR',
+  'NOW', 'OFF', 'TAG', 'VND', 'USD', 'EUR',
   'KHO', 'HANG', 'MOI', 'CU', 'LIKE', 'SUB', 'VIEW',
   'TET', 'BLACK', 'FRIDAY', 'MEGA', 'SUPER', 'PLUS',
+  'LIST', 'BACK',
 ]);
 
 // ─── Phát hiện URL ────────────────────────────────────────────────────────────
@@ -67,20 +71,26 @@ function extractCodes(text) {
   return [...found];
 }
 
-// ─── Gửi tin nhắn Telegram ────────────────────────────────────────────────────
-async function sendMessage(chatId, text, replyToId = null) {
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-  };
-  if (replyToId) body.reply_to_message_id = replyToId;
+// ─── Escape HTML để không bị lỗi parse_mode ──────────────────────────────────
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
-  const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
+// ─── Chỉnh sửa tin nhắn gốc ──────────────────────────────────────────────────
+async function editMessage(chatId, messageId, newText) {
+  const res = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: newText,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }),
   });
   return res.json();
 }
@@ -89,22 +99,35 @@ async function sendMessage(chatId, text, replyToId = null) {
 async function processMessage(message) {
   if (!message) return;
 
-  // ✅ Chỉ xử lý nếu chat ID nằm trong danh sách cho phép
+  // Chỉ xử lý chat trong danh sách cho phép
   if (!isAllowed(message.chat.id)) return;
 
   const text = message.text || message.caption || '';
   if (!text) return;
 
+  // Nếu bài đã có marker → bot đã sửa rồi, bỏ qua (tránh vòng lặp vô tận)
+  if (text.includes(CODES_MARKER)) return;
+
   const codes = extractCodes(text);
   if (codes.length === 0) return;
 
   const codeList = codes.map(c => `<code>${c}</code>`).join('\n');
-  const reply =
-    `🏷️ <b>${codes.length > 1 ? 'Các mã' : 'Mã'} phát hiện:</b>\n\n` +
-    `${codeList}\n\n` +
-    `<i>👆 Nhấn vào mã để sao chép</i>`;
 
-  await sendMessage(message.chat.id, reply, message.message_id);
+  // Ghép nội dung gốc (escape HTML) + phần mã phía dưới
+  const newText =
+    escapeHtml(text) +
+    '\n\n━━━━━━━━━━━━━━\n' +
+    `🏷️ <b>${codes.length > 1 ? 'Các mã' : 'Mã'} phát hiện:</b>\n\n` +
+    codeList + '\n\n' +
+    `<i>${CODES_MARKER}</i>`;
+
+  // Telegram giới hạn 4096 ký tự / tin nhắn
+  if (newText.length > 4096) {
+    console.warn('Message too long to edit:', newText.length);
+    return;
+  }
+
+  await editMessage(message.chat.id, message.message_id, newText);
 }
 
 // ─── Vercel Serverless Handler ────────────────────────────────────────────────
@@ -120,14 +143,10 @@ module.exports = async function handler(req, res) {
   try {
     const update = req.body;
 
+    // Chỉ xử lý tin nhắn MỚI — không xử lý edited để tránh vòng lặp
     const message = update.message || update.channel_post;
     if (message) {
       await processMessage(message);
-    }
-
-    const edited = update.edited_message || update.edited_channel_post;
-    if (edited) {
-      await processMessage(edited);
     }
   } catch (err) {
     console.error('Bot error:', err);
