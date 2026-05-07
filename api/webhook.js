@@ -1,4 +1,4 @@
-// api/webhook.js — Telegram Code Detector Bot
+// api/webhook.js — Telegram Code Detector Bot (Fixed)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
@@ -27,6 +27,8 @@ const EXCLUDED_WORDS = new Set([
   'LIST', 'BACK',
 ]);
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 function isUrl(token) {
   if (/^https?:\/\//i.test(token)) return true;
   if (/^www\./i.test(token)) return true;
@@ -47,18 +49,14 @@ function isCode(word) {
   return true;
 }
 
-// ─── Thay thế mã inline, giữ nguyên phần còn lại ────────────────────────────
 function inlineWrapCodes(text) {
-  // Tách theo khoảng trắng nhưng giữ lại delimiter để ghép lại đúng
   return text.replace(/(\S+)/g, (token) => {
     if (isUrl(token)) return token;
 
-    // Tách phần prefix/suffix không phải chữ số
     const match = token.match(/^([^A-Za-z0-9]*)([A-Za-z0-9][^\s]*)([^A-Za-z0-9]*)$/);
     if (!match) return token;
 
     const [, prefix, core, suffix] = match;
-
     if (isCode(core)) {
       return `${prefix}<code>${core}</code>${suffix}`;
     }
@@ -66,7 +64,10 @@ function inlineWrapCodes(text) {
   });
 }
 
-async function editMessage(chatId, messageId, newText) {
+// ─── API calls ────────────────────────────────────────────────────────────────
+
+// Dùng cho tin nhắn TEXT THUẦN (không có ảnh/video/file)
+async function editMessageText(chatId, messageId, newText) {
   const res = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -78,34 +79,82 @@ async function editMessage(chatId, messageId, newText) {
       disable_web_page_preview: true,
     }),
   });
-  return res.json();
+  const data = await res.json();
+  if (!data.ok) console.warn('editMessageText failed:', data.description);
+  return data;
 }
+
+// Dùng cho tin nhắn CÓ MEDIA (ảnh, video, file, v.v.) — sửa caption
+async function editMessageCaption(chatId, messageId, newCaption) {
+  const res = await fetch(`${TELEGRAM_API}/editMessageCaption`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      caption: newCaption,
+      parse_mode: 'HTML',
+    }),
+  });
+  const data = await res.json();
+  if (!data.ok) console.warn('editMessageCaption failed:', data.description);
+  return data;
+}
+
+// ─── Xác định message có media không ─────────────────────────────────────────
+
+function hasMedia(message) {
+  return !!(
+    message.photo ||
+    message.video ||
+    message.document ||
+    message.animation ||
+    message.audio ||
+    message.voice ||
+    message.sticker
+  );
+}
+
+// ─── Xử lý chính ─────────────────────────────────────────────────────────────
 
 async function processMessage(message) {
   if (!message) return;
   if (!ALLOWED_IDS.has(message.chat.id)) return;
 
+  const isMediaMessage = hasMedia(message);
+
+  // Lấy nội dung text: text thuần hoặc caption của media
   const text = message.text || message.caption || '';
   if (!text) return;
 
-  // Nếu đã có EDIT_MARKER → bài đã sửa rồi, bỏ qua
+  // Đã được bot sửa rồi → bỏ qua
   if (text.includes(EDIT_MARKER)) return;
 
   const wrapped = inlineWrapCodes(text);
 
-  // Không có gì thay đổi → không cần edit
+  // Không có thay đổi gì → không cần edit
   if (wrapped === text) return;
 
-  // Thêm EDIT_MARKER vô hình vào cuối để đánh dấu
   const final = wrapped + EDIT_MARKER;
 
   if (final.length > 4096) {
-    console.warn('Too long:', final.length);
+    console.warn('Content too long, skipping:', final.length);
     return;
   }
 
-  await editMessage(message.chat.id, message.message_id, final);
+  if (isMediaMessage) {
+    // ✅ FIX: Đợi bot ảnh xử lý xong trước để tránh race condition
+    // Bot ảnh (snapframe) sẽ editMessageMedia trước, sau đó mình mới edit caption
+    await new Promise(r => setTimeout(r, 3500));
+
+    await editMessageCaption(message.chat.id, message.message_id, final);
+  } else {
+    // Tin nhắn text thuần → dùng editMessageText như bình thường
+    await editMessageText(message.chat.id, message.message_id, final);
+  }
 }
+
+// ─── Handler chính ────────────────────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
   if (req.method === 'GET') {
