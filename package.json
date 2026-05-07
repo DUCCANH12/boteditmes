@@ -1,0 +1,17 @@
+{
+  "name": "boteditmes",
+  "version": "1.0.0",
+  "description": "Telegram bot phát hiện và copy mã khuyến mãi tự động",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "vercel": "^33.0.0"
+  }
+}
