@@ -1,4 +1,4 @@
-// api/webhook.js — Telegram Code Detector Bot (Fixed)
+// api/webhook.js — Telegram Code Detector Bot
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
@@ -29,11 +29,21 @@ const EXCLUDED_WORDS = new Set([
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Dùng trong inlineWrapCodes để skip URL token (giữ nguyên logic cũ, rộng)
 function isUrl(token) {
   if (/^https?:\/\//i.test(token)) return true;
   if (/^www\./i.test(token)) return true;
   if (/[\w\-]+\.(com|vn|net|org|io|co|app|top|shop|info|biz|me|link|page|site|store|click|ly|gl)(\/\S*)?$/i.test(token)) return true;
   if (/[\/:]/.test(token)) return true;
+  return false;
+}
+
+// Dùng trong boldLine — chặt hơn, không nhầm "25/4", "0h:", "300k/0đ"
+function isRealUrl(token) {
+  if (/^https?:\/\//i.test(token)) return true;
+  if (/^www\./i.test(token)) return true;
+  if (/^[\w\-]+\.[\w\-]+\.(com|vn|net|org|io|co|app|top|shop|info|biz|me|link|page|site|store|click|ly|gl)(\/\S*)?$/i.test(token)) return true;
+  if (/^[\w\-]+\.(com|vn|net|org|io|co|app|top|shop|info|biz|me|link|page|site|store|click|ly|gl)(\/\S*)?$/i.test(token)) return true;
   return false;
 }
 
@@ -49,101 +59,77 @@ function isCode(word) {
   return true;
 }
 
-// ─── Chức năng 1: Xóa https:// / http:// khỏi URL ────────────────────────────
+// ─── Chức năng 1: Xóa https:// / http:// ─────────────────────────────────────
 
 function stripHttps(text) {
   return text.replace(/https?:\/\//gi, '');
 }
 
-// ─── Chức năng 2: In đậm dòng bắt đầu bằng số thứ tự hoặc emoji đặc biệt ────
-// Gọi SAU khi đã stripHttps và SAU khi inlineWrapCodes (để detect URL đúng)
+// ─── Chức năng 2: In đậm dòng trigger ────────────────────────────────────────
 
 const BOLD_TRIGGER_EMOJIS = ['📌', '🔥', '⚡️', '⚡'];
 
 function isBoldTriggerLine(line) {
   const trimmed = line.trimStart();
-  // Kiểm tra số thứ tự: "1.", "2.", "1)", "2)" ở đầu dòng
   if (/^\d+[.)]\s/.test(trimmed)) return true;
-  // Kiểm tra emoji đặc biệt ở đầu dòng
   for (const emoji of BOLD_TRIGGER_EMOJIS) {
     if (trimmed.startsWith(emoji)) return true;
   }
   return false;
 }
 
-// Tìm vị trí token đầu tiên là URL trong dòng (sau khi đã wrap <code>)
-// Token URL là chuỗi không chứa khoảng trắng, match isUrl
 function boldLine(line) {
-  // Tách các token theo khoảng trắng, xử lý in đậm phần trước URL đầu tiên
-  const tokens = line.split(/(\s+)/); // giữ lại whitespace
+  const tokens = line.split(/(\s+)/);
   let firstUrlIndex = -1;
 
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i].trim();
     if (!t) continue;
-    // Bỏ qua HTML tag <code>...</code> khi check URL
     const stripped = t.replace(/<[^>]+>/g, '');
-    if (isUrl(stripped)) {
+    if (isRealUrl(stripped)) {  // ← isRealUrl thay vì isUrl
       firstUrlIndex = i;
       break;
     }
   }
 
   if (firstUrlIndex === -1) {
-    // Không có URL → in đậm cả dòng
     return `<b>${line}</b>`;
   }
 
-  // Có URL → in đậm phần trước URL đầu tiên (bỏ trailing space/dấu câu)
   const beforeTokens = tokens.slice(0, firstUrlIndex);
-  const fromUrlTokens = tokens.slice(firstUrlIndex);
-
   let beforeText = beforeTokens.join('').trimEnd();
-  const rest = line.slice(beforeText.length); // phần còn lại kể từ URL (kể whitespace giữa)
+  const rest = line.slice(beforeText.length);
 
-  if (!beforeText.trim()) {
-    // Không có gì trước URL → không in đậm gì
-    return line;
-  }
+  if (!beforeText.trim()) return line;
 
   return `<b>${beforeText}</b>${rest}`;
 }
 
 function applyLineBolding(text) {
-  const lines = text.split('\n');
-  const result = lines.map(line => {
-    if (isBoldTriggerLine(line)) {
-      return boldLine(line);
-    }
-    return line;
-  });
-  return result.join('\n');
+  return text.split('\n').map(line =>
+    isBoldTriggerLine(line) ? boldLine(line) : line
+  ).join('\n');
 }
 
-// ─── Wrap code tokens (giữ nguyên logic cũ) ──────────────────────────────────
+// ─── Wrap <code> cho mã ───────────────────────────────────────────────────────
 
 function inlineWrapCodes(text) {
   return text.replace(/(\S+)/g, (token) => {
     if (isUrl(token)) return token;
-
     const match = token.match(/^([^A-Za-z0-9]*)([A-Za-z0-9][^\s]*)([^A-Za-z0-9]*)$/);
     if (!match) return token;
-
     const [, prefix, core, suffix] = match;
-    if (isCode(core)) {
-      return `${prefix}<code>${core}</code>${suffix}`;
-    }
+    if (isCode(core)) return `${prefix}<code>${core}</code>${suffix}`;
     return token;
   });
 }
 
-// ─── Pipeline xử lý text tổng hợp ────────────────────────────────────────────
+// ─── Pipeline ─────────────────────────────────────────────────────────────────
 
 function processText(text) {
-  let result = text;
-  result = stripHttps(result);        // 1. Xóa https://
-  result = inlineWrapCodes(result);   // 2. Wrap <code> cho mã
-  result = applyLineBolding(result);  // 3. In đậm dòng trigger (sau khi biết URL)
+  let result = stripHttps(text);       // 1. Xóa https://
+  result = inlineWrapCodes(result);    // 2. Wrap <code> cho mã
+  result = applyLineBolding(result);   // 3. In đậm dòng trigger
   return result;
 }
 
@@ -186,13 +172,8 @@ async function editMessageCaption(chatId, messageId, newCaption) {
 
 function hasMedia(message) {
   return !!(
-    message.photo ||
-    message.video ||
-    message.document ||
-    message.animation ||
-    message.audio ||
-    message.voice ||
-    message.sticker
+    message.photo || message.video || message.document ||
+    message.animation || message.audio || message.voice || message.sticker
   );
 }
 
@@ -208,7 +189,6 @@ async function processMessage(message) {
   if (text.includes(EDIT_MARKER)) return;
 
   const wrapped = processText(text);
-
   if (wrapped === text) return;
 
   const final = wrapped + EDIT_MARKER;
