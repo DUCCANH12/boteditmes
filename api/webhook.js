@@ -2,7 +2,7 @@
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-const EDIT_MARKER = '\u200b'; // Zero-width space — dấu hiệu bài đã được bot sửa
+const EDIT_MARKER = '\u200b';
 
 const ALLOWED_IDS = new Set([
   1400175163,
@@ -27,7 +27,7 @@ const EXCLUDED_WORDS = new Set([
   'LIST', 'BACK',
 ]);
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function isUrl(token) {
   if (/^https?:\/\//i.test(token)) return true;
@@ -49,6 +49,79 @@ function isCode(word) {
   return true;
 }
 
+// ─── Chức năng 1: Xóa https:// / http:// khỏi URL ────────────────────────────
+
+function stripHttps(text) {
+  return text.replace(/https?:\/\//gi, '');
+}
+
+// ─── Chức năng 2: In đậm dòng bắt đầu bằng số thứ tự hoặc emoji đặc biệt ────
+// Gọi SAU khi đã stripHttps và SAU khi inlineWrapCodes (để detect URL đúng)
+
+const BOLD_TRIGGER_EMOJIS = ['📌', '🔥', '⚡️', '⚡'];
+
+function isBoldTriggerLine(line) {
+  const trimmed = line.trimStart();
+  // Kiểm tra số thứ tự: "1.", "2.", "1)", "2)" ở đầu dòng
+  if (/^\d+[.)]\s/.test(trimmed)) return true;
+  // Kiểm tra emoji đặc biệt ở đầu dòng
+  for (const emoji of BOLD_TRIGGER_EMOJIS) {
+    if (trimmed.startsWith(emoji)) return true;
+  }
+  return false;
+}
+
+// Tìm vị trí token đầu tiên là URL trong dòng (sau khi đã wrap <code>)
+// Token URL là chuỗi không chứa khoảng trắng, match isUrl
+function boldLine(line) {
+  // Tách các token theo khoảng trắng, xử lý in đậm phần trước URL đầu tiên
+  const tokens = line.split(/(\s+)/); // giữ lại whitespace
+  let firstUrlIndex = -1;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i].trim();
+    if (!t) continue;
+    // Bỏ qua HTML tag <code>...</code> khi check URL
+    const stripped = t.replace(/<[^>]+>/g, '');
+    if (isUrl(stripped)) {
+      firstUrlIndex = i;
+      break;
+    }
+  }
+
+  if (firstUrlIndex === -1) {
+    // Không có URL → in đậm cả dòng
+    return `<b>${line}</b>`;
+  }
+
+  // Có URL → in đậm phần trước URL đầu tiên (bỏ trailing space/dấu câu)
+  const beforeTokens = tokens.slice(0, firstUrlIndex);
+  const fromUrlTokens = tokens.slice(firstUrlIndex);
+
+  let beforeText = beforeTokens.join('').trimEnd();
+  const rest = line.slice(beforeText.length); // phần còn lại kể từ URL (kể whitespace giữa)
+
+  if (!beforeText.trim()) {
+    // Không có gì trước URL → không in đậm gì
+    return line;
+  }
+
+  return `<b>${beforeText}</b>${rest}`;
+}
+
+function applyLineBolding(text) {
+  const lines = text.split('\n');
+  const result = lines.map(line => {
+    if (isBoldTriggerLine(line)) {
+      return boldLine(line);
+    }
+    return line;
+  });
+  return result.join('\n');
+}
+
+// ─── Wrap code tokens (giữ nguyên logic cũ) ──────────────────────────────────
+
 function inlineWrapCodes(text) {
   return text.replace(/(\S+)/g, (token) => {
     if (isUrl(token)) return token;
@@ -64,9 +137,18 @@ function inlineWrapCodes(text) {
   });
 }
 
+// ─── Pipeline xử lý text tổng hợp ────────────────────────────────────────────
+
+function processText(text) {
+  let result = text;
+  result = stripHttps(result);        // 1. Xóa https://
+  result = inlineWrapCodes(result);   // 2. Wrap <code> cho mã
+  result = applyLineBolding(result);  // 3. In đậm dòng trigger (sau khi biết URL)
+  return result;
+}
+
 // ─── API calls ────────────────────────────────────────────────────────────────
 
-// Dùng cho tin nhắn TEXT THUẦN (không có ảnh/video/file)
 async function editMessageText(chatId, messageId, newText) {
   const res = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
@@ -84,7 +166,6 @@ async function editMessageText(chatId, messageId, newText) {
   return data;
 }
 
-// Dùng cho tin nhắn CÓ MEDIA (ảnh, video, file, v.v.) — sửa caption
 async function editMessageCaption(chatId, messageId, newCaption) {
   const res = await fetch(`${TELEGRAM_API}/editMessageCaption`, {
     method: 'POST',
@@ -122,17 +203,12 @@ async function processMessage(message) {
   if (!ALLOWED_IDS.has(message.chat.id)) return;
 
   const isMediaMessage = hasMedia(message);
-
-  // Lấy nội dung text: text thuần hoặc caption của media
   const text = message.text || message.caption || '';
   if (!text) return;
-
-  // Đã được bot sửa rồi → bỏ qua
   if (text.includes(EDIT_MARKER)) return;
 
-  const wrapped = inlineWrapCodes(text);
+  const wrapped = processText(text);
 
-  // Không có thay đổi gì → không cần edit
   if (wrapped === text) return;
 
   const final = wrapped + EDIT_MARKER;
@@ -143,13 +219,9 @@ async function processMessage(message) {
   }
 
   if (isMediaMessage) {
-    // ✅ FIX: Đợi bot ảnh xử lý xong trước để tránh race condition
-    // Bot ảnh (snapframe) sẽ editMessageMedia trước, sau đó mình mới edit caption
     await new Promise(r => setTimeout(r, 3500));
-
     await editMessageCaption(message.chat.id, message.message_id, final);
   } else {
-    // Tin nhắn text thuần → dùng editMessageText như bình thường
     await editMessageText(message.chat.id, message.message_id, final);
   }
 }
@@ -168,7 +240,6 @@ module.exports = async function handler(req, res) {
     const update = req.body;
     const message = update.message || update.channel_post;
     if (message) await processMessage(message);
-    // Không xử lý edited_message để tránh vòng lặp
   } catch (err) {
     console.error('Bot error:', err);
   }
