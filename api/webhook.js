@@ -2,7 +2,7 @@
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-const EDIT_MARKER = '\u200b';
+const EDIT_MARKER = '\u200b'; // Zero-width space — dấu hiệu bài đã được bot sửa
 
 const ALLOWED_IDS = new Set([
   1400175163,
@@ -27,9 +27,9 @@ const EXCLUDED_WORDS = new Set([
   'LIST', 'BACK',
 ]);
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── URL detection ────────────────────────────────────────────────────────────
 
-// Dùng trong inlineWrapCodes để skip URL token (giữ nguyên logic cũ, rộng)
+// Dùng trong inlineWrapCodes để skip token URL (rộng, tránh wrap nhầm)
 function isUrl(token) {
   if (/^https?:\/\//i.test(token)) return true;
   if (/^www\./i.test(token)) return true;
@@ -47,6 +47,8 @@ function isRealUrl(token) {
   return false;
 }
 
+// ─── isCode ───────────────────────────────────────────────────────────────────
+
 function isCode(word) {
   const cleaned = word.replace(/^[^A-Z0-9a-z]+|[^A-Z0-9a-z]+$/gi, '');
   if (!cleaned) return false;
@@ -59,13 +61,26 @@ function isCode(word) {
   return true;
 }
 
-// ─── Chức năng 1: Xóa https:// / http:// ─────────────────────────────────────
+// ─── Bước 1: Xóa https:// / http:// ─────────────────────────────────────────
 
 function stripHttps(text) {
   return text.replace(/https?:\/\//gi, '');
 }
 
-// ─── Chức năng 2: In đậm dòng trigger ────────────────────────────────────────
+// ─── Bước 2: Wrap <code> cho mã ──────────────────────────────────────────────
+
+function inlineWrapCodes(text) {
+  return text.replace(/(\S+)/g, (token) => {
+    if (isUrl(token)) return token;
+    const match = token.match(/^([^A-Za-z0-9]*)([A-Za-z0-9][^\s]*)([^A-Za-z0-9]*)$/);
+    if (!match) return token;
+    const [, prefix, core, suffix] = match;
+    if (isCode(core)) return `${prefix}<code>${core}</code>${suffix}`;
+    return token;
+  });
+}
+
+// ─── Bước 3: In đậm dòng trigger ─────────────────────────────────────────────
 
 const BOLD_TRIGGER_EMOJIS = ['📌', '🔥', '⚡️', '⚡'];
 
@@ -81,27 +96,16 @@ function isBoldTriggerLine(line) {
 function boldLine(line) {
   const tokens = line.split(/(\s+)/);
   let firstUrlIndex = -1;
-
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i].trim();
     if (!t) continue;
     const stripped = t.replace(/<[^>]+>/g, '');
-    if (isRealUrl(stripped)) {  // ← isRealUrl thay vì isUrl
-      firstUrlIndex = i;
-      break;
-    }
+    if (isRealUrl(stripped)) { firstUrlIndex = i; break; }
   }
-
-  if (firstUrlIndex === -1) {
-    return `<b>${line}</b>`;
-  }
-
-  const beforeTokens = tokens.slice(0, firstUrlIndex);
-  let beforeText = beforeTokens.join('').trimEnd();
+  if (firstUrlIndex === -1) return `<b>${line}</b>`;
+  const beforeText = tokens.slice(0, firstUrlIndex).join('').trimEnd();
   const rest = line.slice(beforeText.length);
-
   if (!beforeText.trim()) return line;
-
   return `<b>${beforeText}</b>${rest}`;
 }
 
@@ -111,26 +115,32 @@ function applyLineBolding(text) {
   ).join('\n');
 }
 
-// ─── Wrap <code> cho mã ───────────────────────────────────────────────────────
+// ─── Pipeline với fallback khi quá dài ───────────────────────────────────────
+//
+//  Level 1 (full):     stripHttps → inlineWrapCodes → applyLineBolding
+//  Level 2 (no code):  stripHttps → applyLineBolding          (bỏ <code>)
+//  Level 3 (minimal):  stripHttps                              (bỏ cả bold)
+//
+// Lý do cần fallback: mỗi <code>token</code> thêm 13 ký tự,
+// tin dài nhiều mã AFF có thể đẩy tổng vượt giới hạn 4096 của Telegram.
 
-function inlineWrapCodes(text) {
-  return text.replace(/(\S+)/g, (token) => {
-    if (isUrl(token)) return token;
-    const match = token.match(/^([^A-Za-z0-9]*)([A-Za-z0-9][^\s]*)([^A-Za-z0-9]*)$/);
-    if (!match) return token;
-    const [, prefix, core, suffix] = match;
-    if (isCode(core)) return `${prefix}<code>${core}</code>${suffix}`;
-    return token;
-  });
-}
+function buildFinal(text) {
+  // Level 1
+  let result = applyLineBolding(inlineWrapCodes(stripHttps(text)));
+  if ((result + EDIT_MARKER).length <= 4096) return result;
 
-// ─── Pipeline ─────────────────────────────────────────────────────────────────
+  // Level 2 — bỏ <code>
+  console.warn('Fallback level 2: bỏ <code>, giữ bold + strip https');
+  result = applyLineBolding(stripHttps(text));
+  if ((result + EDIT_MARKER).length <= 4096) return result;
 
-function processText(text) {
-  let result = stripHttps(text);       // 1. Xóa https://
-  result = inlineWrapCodes(result);    // 2. Wrap <code> cho mã
-  result = applyLineBolding(result);   // 3. In đậm dòng trigger
-  return result;
+  // Level 3 — chỉ strip https
+  console.warn('Fallback level 3: chỉ strip https');
+  result = stripHttps(text);
+  if ((result + EDIT_MARKER).length <= 4096) return result;
+
+  // Quá dài không thể xử lý
+  return null;
 }
 
 // ─── API calls ────────────────────────────────────────────────────────────────
@@ -188,15 +198,15 @@ async function processMessage(message) {
   if (!text) return;
   if (text.includes(EDIT_MARKER)) return;
 
-  const wrapped = processText(text);
-  if (wrapped === text) return;
+  const wrapped = buildFinal(text);
 
-  const final = wrapped + EDIT_MARKER;
-
-  if (final.length > 4096) {
-    console.warn('Content too long, skipping:', final.length);
+  if (wrapped === null) {
+    console.warn('Tin quá dài kể cả sau fallback, bỏ qua:', text.length);
     return;
   }
+  if (wrapped === text) return; // Không có gì thay đổi
+
+  const final = wrapped + EDIT_MARKER;
 
   if (isMediaMessage) {
     await new Promise(r => setTimeout(r, 3500));
@@ -220,6 +230,7 @@ module.exports = async function handler(req, res) {
     const update = req.body;
     const message = update.message || update.channel_post;
     if (message) await processMessage(message);
+    // Không xử lý edited_message để tránh vòng lặp
   } catch (err) {
     console.error('Bot error:', err);
   }
