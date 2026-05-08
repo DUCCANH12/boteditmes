@@ -124,14 +124,16 @@ function applyLineBolding(text) {
 // Lý do cần fallback: mỗi <code>token</code> thêm 13 ký tự,
 // tin dài nhiều mã AFF có thể đẩy tổng vượt giới hạn 4096 của Telegram.
 
+// ─── Pipeline với fallback khi quá dài ───────────────────────────────────────
+
 function buildFinal(text) {
-  // Level 1
+  // Level 1 — full
   let result = applyLineBolding(inlineWrapCodes(stripHttps(text)));
   if ((result + EDIT_MARKER).length <= 4096) return result;
 
-  // Level 2 — bỏ <code>
-  console.warn('Fallback level 2: bỏ <code>, giữ bold + strip https');
-  result = applyLineBolding(stripHttps(text));
+  // Level 2 — bỏ bold, giữ <code> + strip https  ← đổi chỗ
+  console.warn('Fallback level 2: bỏ bold, giữ <code> + strip https');
+  result = inlineWrapCodes(stripHttps(text));
   if ((result + EDIT_MARKER).length <= 4096) return result;
 
   // Level 3 — chỉ strip https
@@ -139,7 +141,6 @@ function buildFinal(text) {
   result = stripHttps(text);
   if ((result + EDIT_MARKER).length <= 4096) return result;
 
-  // Quá dài không thể xử lý
   return null;
 }
 
